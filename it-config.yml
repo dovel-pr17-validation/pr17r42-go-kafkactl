@@ -1,0 +1,82 @@
+contexts:
+  # default context without SASL
+  default:
+    brokers:
+      - localhost:19093
+      - localhost:29093
+      - localhost:39093
+    requestTimeout: 15s
+    schemaRegistry:
+      url: localhost:18081
+    kafkaversion: 3.0.0
+
+  # context without schema registry
+  no-schema-reg:
+    brokers:
+      - localhost:19093
+      - localhost:29093
+      - localhost:39093
+    requestTimeout: 15s
+    kafkaversion: 3.0.0
+
+  # sasl context as admin
+  sasl-admin:
+    brokers:
+      - localhost:19092
+      - localhost:29092
+      - localhost:39092
+    requestTimeout: 15s
+    sasl:
+      enabled: true
+      username: admin
+      password: admin-secret
+    schemaRegistry:
+      url: localhost:18081
+    kafkaversion: 3.0.0
+
+  # sasl context as user
+  sasl-user:
+    brokers:
+      - localhost:19092
+      - localhost:29092
+      - localhost:39092
+    requestTimeout: 15s
+    sasl:
+      enabled: true
+      username: user
+      password: user-secret
+    schemaRegistry:
+      url: localhost:18081
+    kafkaversion: 3.0.0
+
+  # k8s-mock context with mocked kubectl
+  k8s-mock:
+    brokers:
+      - localhost:19093
+      - localhost:29093
+      - localhost:39093
+    requestTimeout: 15s
+    kubernetes:
+      enabled: true
+      binary: docker/kubectl-mock.sh
+      kubeContext: k8s-cluster
+      namespace: k8s-namespace
+    kafkaversion: 3.0.0
+
+  # scram context for SCRAM user management testing
+  scram-admin:
+    brokers:
+      - localhost:19094
+      - localhost:29094
+      - localhost:39094
+    requestTimeout: 15s
+    sasl:
+      enabled: true
+      mechanism: SCRAM-SHA-256
+      username: admin
+      password: admin-secret
+    schemaRegistry:
+      url: localhost:18081
+    kafkaversion: 3.0.0
+
+current-context: default

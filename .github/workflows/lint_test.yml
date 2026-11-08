@@ -1,0 +1,75 @@
+name: Lint / Test / IT
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Run Lint
+        run: make lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Run Unit tests
+        run: make test
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test.log
+
+  integration_test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # https://docs.confluent.io/platform/current/installation/versions-interoperability.html
+        kafka_version: [3.9.0, 3.8.0, 3.7.0]
+        include:
+          - kafka_version: 3.9.0
+            cp_version: 7.9.2
+          - kafka_version: 3.8.0
+            cp_version: 7.8.3
+          - kafka_version: 3.7.0
+            cp_version: 7.7.4
+
+    env:
+      CP_VERSION: ${{ matrix.cp_version }}
+      KAFKAVERSION: ${{ matrix.kafka_version }}
+      REQUESTTIMEOUT: 15s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Run integration tests
+        uses: nick-fields/retry@v2
+        with:
+          max_attempts: 2
+          retry_on: error
+          timeout_minutes: 10
+          command: make integration_test
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: it-logs-${{ matrix.cp_version }}
+          path: integration-test.log
+          overwrite: true

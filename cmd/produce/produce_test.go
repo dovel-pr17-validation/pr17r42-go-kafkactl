@@ -1,0 +1,1189 @@
+package produce_test
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/dynamicpb"
+
+	"github.com/linkedin/goavro/v2"
+	"github.com/riferrei/srclient"
+
+	"github.com/deviceinsight/kafkactl/v5/internal"
+	"github.com/deviceinsight/kafkactl/v5/internal/helpers/protobuf"
+	"github.com/deviceinsight/kafkactl/v5/internal/testutil"
+)
+
+func TestProduceWithKeyAndValueIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", "test-value"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "test-key#test-value", kafkaCtl.GetStdOut())
+}
+
+func TestProduceMessageWithHeadersIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", "test-value", "-H", "key1:value1", "-H", "key\\:2:value\\:2"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--print-headers"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "key1:value1,key\\:2:value\\:2#test-key#test-value", kafkaCtl.GetStdOut())
+}
+
+func TestProduceAvroMessageWithHeadersIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+  "name": "person",
+  "type": "record",
+  "fields": [
+	{
+      "name": "name",
+      "type": "string"
+    }
+  ]
+}`
+	value := `{"name":"Peter Mueller"}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "-H", "key1:value1", "-H", "key\\:2:value\\:2"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--print-headers"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, fmt.Sprintf("key1:value1,key\\:2:value\\:2#test-key#%s", value), kafkaCtl.GetStdOut())
+}
+
+func TestProduceConsumeAvroSchemaFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "produce-avro-file-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	// field order in the decoded JSON isn't guaranteed by goavro's standard JSON codec, so
+	// check the key prefix and each field individually rather than the full string
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestProduceConsumeAvroSchemaFromHeaderIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "produce-avro-header-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value,
+		"--avro-schema-file", schemaFile, "-H", "ce_dataschema:"+(&url.URL{Scheme: "file", Path: filepath.ToSlash(schemaFile)}).String()); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	// no --avro-schema-file passed: resolved from the ce_dataschema header via --avro-schema-header
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys",
+		"--avro-schema-header", "ce_dataschema"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	// field order in the decoded JSON isn't guaranteed by goavro's standard JSON codec, so
+	// check the key prefix and each field individually rather than the full string
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestConsumeAvroStructuredCloudEventIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "consume-avro-structured-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	schemaURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(schemaFile)}).String()
+
+	schema, err := os.ReadFile(schemaFile)
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	codec, err := goavro.NewCodecForStandardJSONFull(string(schema))
+	if err != nil {
+		t.Fatalf("failed to create codec: %v", err)
+	}
+
+	native, _, err := codec.NativeFromTextual([]byte(`{"name":"Peter Mueller","num":42}`))
+	if err != nil {
+		t.Fatalf("failed to convert to native: %v", err)
+	}
+
+	avroData, err := codec.BinaryFromNative(nil, native)
+	if err != nil {
+		t.Fatalf("failed to convert to binary: %v", err)
+	}
+
+	event := fmt.Sprintf(`{"specversion":"1.0","id":"1","source":"/test","type":"test","datacontenttype":"application/avro",`+
+		`"dataschema":%q,"data_base64":%q}`, schemaURI, base64.StdEncoding.EncodeToString(avroData))
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", event,
+		"-H", "content-type:application/cloudevents+json; charset=UTF-8"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit",
+		"--avro-schema-header", "ce_dataschema"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, fmt.Sprintf(`{"specversion":"1.0","id":"1","source":"/test","type":"test",`+
+		`"datacontenttype":"application/avro","dataschema":%q,"data":{`, schemaURI), stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestProduceAvroSchemaFileTakesPrecedenceOverRegistryIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	// deliberately different from testdata/msg.avsc, so a registry-encoded message would not
+	// round-trip cleanly with it.
+	registrySchema := `{"type":"record","name":"Unrelated","fields":[{"name":"unrelated","type":"string"}]}`
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-avro-file-precedence-topic", "", registrySchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	// even though the topic has a registered (and incompatible) avro schema, --avro-schema-file
+	// must still take precedence and encode the value with the local schema, unframed.
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestProduceAvroMessageOmitDefaultValueIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "name": "CreateUserProfileWallet",
+	  "namespace": "Messaging.Contracts.WalletManager.Commands",
+	  "type": "record",
+	  "fields": [
+		{ "name": "CurrencyCode", "type": "string" },
+		{ "name": "ExpiresOn", "type": ["null", "string"], "default": null}
+	  ]
+	}`
+	value := `{
+	 "CurrencyCode": "EUR"
+	}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-avro-topic", "", valueSchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, `"CurrencyCode":"EUR"`, stdout)
+	testutil.AssertContainSubstring(t, `"ExpiresOn":null`, stdout)
+}
+
+func TestProduceAvroMessageWithUnionStandardJsonIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "name": "CreateUserProfileWallet",
+	  "namespace": "Messaging.Contracts.WalletManager.Commands",
+	  "type": "record",
+	  "fields": [
+		{ "name": "CurrencyCode", "type": "string" },
+		{ "name": "ExpiresOn", "type": ["null", "string"], "default": null}
+	  ]
+	}`
+
+	value := `{
+	 "CurrencyCode": "EUR",
+	 "ExpiresOn": "2022-12-12"
+	}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, `"CurrencyCode":"EUR"`, stdout)
+	testutil.AssertContainSubstring(t, `"ExpiresOn":"2022-12-12"`, stdout)
+}
+
+func TestProduceRegistryProtobufMessageWithHeadersIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `syntax = "proto3";
+  package foo.bar;
+
+  message Msg {
+    string name = 1;
+  }`
+	value := `{"name":"Peter Mueller"}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-protobuf-topic", "", valueSchema, srclient.Protobuf)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "-H", "key1:value1", "-H", "key\\:2:value\\:2"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--print-headers"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, fmt.Sprintf("key1:value1,key\\:2:value\\:2#test-key#%s", value), kafkaCtl.GetStdOut())
+}
+
+func TestProduceRegistryProtobufMessageOmitDefaultValueIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `syntax = "proto3";
+  package foo.bar;
+
+  message Msg {
+    string current_code = 1;
+    string expires_on = 2;
+  }`
+	value := `{"currentCode":"EUR"}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-protobuf-topic", "", valueSchema, srclient.Protobuf)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning",
+		"--proto-marshal-option", "emitDefaultValues", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, `"currentCode":"EUR"`, stdout)
+	testutil.AssertContainSubstring(t, `"expiresOn":""`, stdout)
+}
+
+func TestProduceJsonMessageWithSchemaIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "$schema": "http://json-schema.org/draft-04/schema#",
+	  "type": "object",
+	  "properties": {
+		"CurrencyCode": {
+		  "type": "string"
+		},
+		"ExpiresOn": {
+		  "type": "string",
+		  "format": "date"
+		}
+	  },
+	  "required": [
+		"CurrencyCode",
+		"ExpiresOn"
+	  ]
+	}`
+
+	value := `{
+	 "CurrencyCode": "EUR",
+	 "ExpiresOn": "2022-12-12"
+	}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Json)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, `"CurrencyCode": "EUR"`, stdout)
+	testutil.AssertContainSubstring(t, `"ExpiresOn": "2022-12-12"`, stdout)
+}
+
+func TestProduceJsonMessageWithSchemaValidationErrorIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "$schema": "http://json-schema.org/draft-04/schema#",
+	  "type": "object",
+	  "properties": {
+		"Name": {
+		  "type": "string"
+		},
+		"Age": {
+		  "type": "integer"
+		}
+	  },
+	  "required": [
+		"Name",
+		"Age"
+	  ]
+	}`
+
+	// Missing required field "Age"
+	value := `{"Name": "Alice"}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Json)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	_, err := kafkaCtl.Execute("produce", topicName, "--value", value)
+	if err == nil {
+		t.Fatalf("expected validation error but got none")
+	}
+
+	testutil.AssertErrorContains(t, "json data does not match schema", err)
+}
+
+func TestProduceJsonMessageWithSchemaAndPrintSchemaIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "$schema": "http://json-schema.org/draft-04/schema#",
+	  "type": "object",
+	  "properties": {
+		"City": {
+		  "type": "string"
+		}
+	  },
+	  "required": [
+		"City"
+	  ]
+	}`
+
+	value := `{"City": "Berlin"}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Json)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-schema", "-o", "yaml"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "City", stdout)
+	testutil.AssertContainSubstring(t, "Berlin", stdout)
+	testutil.AssertContainSubstring(t, "valueSchema:", stdout)
+	testutil.AssertContainSubstring(t, "valueSchemaId:", stdout)
+}
+
+func TestProduceAvroMessageWithUnionAvroJsonIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	valueSchema := `{
+	  "name": "CreateUserProfileWallet",
+	  "namespace": "Messaging.Contracts.WalletManager.Commands",
+	  "type": "record",
+	  "fields": [
+		{ "name": "CurrencyCode", "type": "string" },
+		{ "name": "ExpiresOn", "type": ["null", "string"], "default": null}
+	  ]
+	}`
+
+	value := `{
+	 "CurrencyCode": "EUR",
+	 "ExpiresOn": {"string": "2022-12-12"}
+	}`
+
+	if err := os.Setenv("AVRO_JSONCODEC", "avro"); err != nil {
+		t.Fatalf("unable to set env variable: %v", err)
+	}
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-topic", "", valueSchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", value); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, `"CurrencyCode":"EUR"`, stdout)
+	testutil.AssertContainSubstring(t, `"ExpiresOn":{"string":"2022-12-12"}`, stdout)
+}
+
+func TestProduceNullValueStringTreatedAsTombstoneIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", "null"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "-o", "yaml", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	record := strings.ReplaceAll(kafkaCtl.GetStdOut(), "\n", " ")
+	testutil.AssertContainSubstring(t, "value: null", record)
+}
+
+func TestProduceNullKeyStringTreatedAsNullKeyIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "null", "--value", "test-value"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "-o", "yaml", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	record := strings.ReplaceAll(kafkaCtl.GetStdOut(), "\n", " ")
+	testutil.AssertContainNoSubstring(t, "key:", record)
+	testutil.AssertContainSubstring(t, "value: test-value", record)
+}
+
+func TestProduceNullStringLiteralViaBase64Integration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	// base64("null") = "bnVsbA==" — use encoding to write the literal string "null"
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", "bnVsbA==", "--value-encoding", "base64"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "test-key#null", kafkaCtl.GetStdOut())
+}
+
+func TestProduceTombstoneIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--null-value"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "-o", "yaml", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	record := strings.ReplaceAll(kafkaCtl.GetStdOut(), "\n", " ")
+	testutil.AssertEquals(t, "partition: 0 offset: 0 value: null", record)
+}
+
+func TestProduceFromBase64Integration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName,
+		"--key", "dGVzdC1rZXk=", "--key-encoding", "base64",
+		"--value", "dGVzdC12YWx1ZQ==", "--value-encoding", "base64"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "test-key#test-value", kafkaCtl.GetStdOut())
+}
+
+func TestProduceFromHexIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topicName := testutil.CreateTopic(t, "produce-topic")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName,
+		"--key", "test-key",
+		"--value", "0000000000000000", "--value-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--value-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "test-key#0000000000000000", kafkaCtl.GetStdOut())
+}
+
+func TestProduceAutoCompletionIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	prefix := "produce-complete-"
+
+	topicName1 := testutil.CreateTopic(t, prefix+"a")
+	topicName2 := testutil.CreateTopic(t, prefix+"b")
+	topicName3 := testutil.CreateTopic(t, prefix+"c")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+	kafkaCtl.Verbose = false
+
+	if _, err := kafkaCtl.Execute("__complete", "produce", ""); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	outputLines := strings.Split(strings.TrimSpace(kafkaCtl.GetStdOut()), "\n")
+
+	testutil.AssertContains(t, topicName1, outputLines)
+	testutil.AssertContains(t, topicName2, outputLines)
+	testutil.AssertContains(t, topicName3, outputLines)
+}
+
+func TestProduceProtoFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	key := `{"fvalue":1.2}`
+	value := `{"producedAt":"2021-12-01T14:10:12Z","num":"1"}`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--key", key, "--key-proto-type", "TopicKey",
+		"--value", value, "--value-proto-type", "TopicMessage",
+		"--proto-import-path", protoPath, "--proto-file", "msg.proto"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", pbTopic, "--from-beginning", "--exit", "--print-keys", "--key-encoding", "hex", "--value-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	kv := strings.Split(kafkaCtl.GetStdOut(), "#")
+
+	rawKey, err := hex.DecodeString(strings.TrimSpace(kv[0]))
+	if err != nil {
+		t.Fatalf("Failed to decode key: %s", err)
+	}
+
+	rawValue, err := hex.DecodeString(strings.TrimSpace(kv[1]))
+	if err != nil {
+		t.Fatalf("Failed to decode value: %s", err)
+	}
+
+	keyMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtoImportPaths: []string{protoPath},
+		ProtoFiles:       []string{"msg.proto"},
+	}, "TopicKey"))
+	valueMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtoImportPaths: []string{protoPath},
+		ProtoFiles:       []string{"msg.proto"},
+	}, "TopicMessage"))
+
+	if err = proto.Unmarshal(rawKey, keyMessage); err != nil {
+		t.Fatalf("Unmarshal key failed: %s", err)
+	}
+	if err = proto.Unmarshal(rawValue, valueMessage); err != nil {
+		t.Fatalf("Unmarshal value failed: %s", err)
+	}
+
+	actualKey, err := marshalJSON(keyMessage)
+	if err != nil {
+		t.Fatalf("Key to json failed: %s", err)
+	}
+
+	actualValue, err := marshalJSON(valueMessage)
+	if err != nil {
+		t.Fatalf("Value to json failed: %s", err)
+	}
+
+	testutil.AssertEquals(t, key, string(actualKey))
+	testutil.AssertEquals(t, value, string(actualValue))
+}
+
+func TestProduceWithCSVFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+	topic := testutil.CreateTopic(t, "produce-topic-csv")
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	dataFilePath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--separator", ",",
+		"--file", filepath.Join(dataFilePath, "msg.csv")); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "3 messages produced", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topic, "--from-beginning", "--print-keys", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "1#a\n2#b\n3#c", kafkaCtl.GetStdOut())
+}
+
+func TestProduceWithCSVFileWithTimestampsFirstColumnIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+	topic := testutil.CreateTopic(t, "produce-topic-csv")
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	dataFilePath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--separator", ",",
+		"--file", filepath.Join(dataFilePath, "msg-ts1.csv")); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "3 messages produced", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topic, "--from-beginning", "--print-keys", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "1#a\n2#b\n3#c", kafkaCtl.GetStdOut())
+}
+
+func TestProduceWithCSVFileWithTimestampsSecondColumnIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+	topic := testutil.CreateTopic(t, "produce-topic-csv")
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	dataFilePath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--separator", ",",
+		"--file", filepath.Join(dataFilePath, "msg-ts2.csv")); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "3 messages produced", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topic, "--from-beginning", "--print-keys", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "1#a\n2#b\n3#c", kafkaCtl.GetStdOut())
+}
+
+func TestProduceWithJSONFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+	topic := testutil.CreateTopic(t, "produce-topic-json")
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	dataFilePath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	if _, err := kafkaCtl.Execute("produce", topic,
+		"--file", filepath.Join(dataFilePath, "msg.json"),
+		"--input-format", "json"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "6 messages produced", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topic, "--from-beginning", "--print-keys", "--print-headers", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	expectedMessages := []string{"a:b,c:1#1#a", "#2#b", "x:y#3#c", "##value-only", "#key-only#null", "##null"}
+	testutil.AssertArraysEquals(t, expectedMessages, kafkaCtl.GetStdOutLines())
+}
+
+func TestProduceWithJSONFileBase64ValuesIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+	topic := testutil.CreateTopic(t, "produce-topic-json-base64-values")
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	dataFilePath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	if _, err := kafkaCtl.Execute("produce", topic,
+		"--file", filepath.Join(dataFilePath, "msg-base64.json"),
+		"--value-encoding", "base64",
+		"--input-format", "json"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "3 messages produced", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topic, "--from-beginning", "--print-keys", "--value-encoding", "hex", "--exit"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "1#000000000001\n2#68656c6c6f\n3#6b61666b61", kafkaCtl.GetStdOut())
+}
+
+func TestProduceProtoFileWithOnlyKeyEncodedIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	key := `{"fvalue":1.2}`
+	value := `{"producedAt":"2021-12-01T14:10:12Z","num":"1"}`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--key", key, "--key-proto-type", "TopicKey",
+		"--value", value, "--proto-file", filepath.Join(protoPath, "msg.proto")); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", pbTopic, "--from-beginning", "--exit", "--print-keys", "--key-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	kv := strings.Split(kafkaCtl.GetStdOut(), "#")
+
+	rawKey, err := hex.DecodeString(strings.TrimSpace(kv[0]))
+	if err != nil {
+		t.Fatalf("Failed to decode key: %s", err)
+	}
+
+	keyMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtoImportPaths: []string{protoPath},
+		ProtoFiles:       []string{"msg.proto"},
+	}, "TopicKey"))
+
+	if err = proto.Unmarshal(rawKey, keyMessage); err != nil {
+		t.Fatalf("Unmarshal key failed: %s", err)
+	}
+
+	actualKey, err := marshalJSON(keyMessage)
+	if err != nil {
+		t.Fatalf("Key to json failed: %s", err)
+	}
+
+	actualValue := strings.TrimSpace(kv[1])
+
+	testutil.AssertEquals(t, key, string(actualKey))
+	testutil.AssertEquals(t, value, actualValue)
+}
+
+func TestProduceProtoFileWithoutProtoImportPathIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	key := `{"fvalue":1.2}`
+	value := `{"producedAt":"2021-12-01T14:10:12Z","num":"1"}`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--key", key, "--key-proto-type", "TopicKey",
+		"--value", value, "--value-proto-type", "TopicMessage",
+		"--proto-file", filepath.Join(protoPath, "msg.proto")); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", pbTopic, "--from-beginning", "--exit", "--print-keys", "--key-encoding", "hex", "--value-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	kv := strings.Split(kafkaCtl.GetStdOut(), "#")
+
+	rawKey, err := hex.DecodeString(strings.TrimSpace(kv[0]))
+	if err != nil {
+		t.Fatalf("Failed to decode key: %s", err)
+	}
+
+	rawValue, err := hex.DecodeString(strings.TrimSpace(kv[1]))
+	if err != nil {
+		t.Fatalf("Failed to decode value: %s", err)
+	}
+
+	keyMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtoImportPaths: []string{protoPath},
+		ProtoFiles:       []string{"msg.proto"},
+	}, "TopicKey"))
+	valueMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtoImportPaths: []string{protoPath},
+		ProtoFiles:       []string{"msg.proto"},
+	}, "TopicMessage"))
+
+	if err = proto.Unmarshal(rawKey, keyMessage); err != nil {
+		t.Fatalf("Unmarshal key failed: %s", err)
+	}
+	if err = proto.Unmarshal(rawValue, valueMessage); err != nil {
+		t.Fatalf("Unmarshal value failed: %s", err)
+	}
+
+	actualKey, err := marshalJSON(keyMessage)
+	if err != nil {
+		t.Fatalf("Key to json failed: %s", err)
+	}
+
+	actualValue, err := marshalJSON(valueMessage)
+	if err != nil {
+		t.Fatalf("Value to json failed: %s", err)
+	}
+
+	testutil.AssertEquals(t, key, string(actualKey))
+	testutil.AssertEquals(t, value, string(actualValue))
+}
+
+func TestProduceProtosetFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.protoset")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	key := `{"fvalue":1.2}`
+	value := `{"producedAt":"2021-12-01T14:10:12Z","num":"1"}`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--key", key, "--key-proto-type", "TopicKey",
+		"--value", value, "--value-proto-type", "TopicMessage",
+		"--protoset-file", protoPath); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", pbTopic, "--from-beginning", "--exit", "--print-keys", "--key-encoding", "hex", "--value-encoding", "hex"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	kv := strings.Split(kafkaCtl.GetStdOut(), "#")
+
+	rawKey, err := hex.DecodeString(strings.TrimSpace(kv[0]))
+	if err != nil {
+		t.Fatalf("Failed to decode key: %s", err)
+	}
+
+	rawValue, err := hex.DecodeString(strings.TrimSpace(kv[1]))
+	if err != nil {
+		t.Fatalf("Failed to decode value: %s", err)
+	}
+
+	keyMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtosetFiles: []string{protoPath},
+	}, "TopicKey"))
+	valueMessage := dynamicpb.NewMessage(protobuf.ResolveMessageType(internal.ProtobufConfig{
+		ProtosetFiles: []string{protoPath},
+	}, "TopicMessage"))
+
+	if err = proto.Unmarshal(rawKey, keyMessage); err != nil {
+		t.Fatalf("Unmarshal key failed: %s", err)
+	}
+	if err = proto.Unmarshal(rawValue, valueMessage); err != nil {
+		t.Fatalf("Unmarshal value failed: %s", err)
+	}
+
+	actualKey, err := marshalJSON(keyMessage)
+	if err != nil {
+		t.Fatalf("Key to json failed: %s", err)
+	}
+
+	actualValue, err := marshalJSON(valueMessage)
+	if err != nil {
+		t.Fatalf("Value to json failed: %s", err)
+	}
+
+	testutil.AssertEquals(t, key, string(actualKey))
+	testutil.AssertEquals(t, value, string(actualValue))
+}
+
+func TestProduceProtoFileBadJSONIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	value := `{"producedAt":"2021-12-01T14:10:1`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--value", value, "--value-proto-type", "TopicMessage",
+		"--proto-import-path", protoPath, "--proto-file", "msg.proto"); err != nil {
+		testutil.AssertErrorContains(t, "invalid json", err)
+	} else {
+		t.Fatalf("Expected producer to fail")
+	}
+}
+
+func TestProduceProtoFileErrNoMessageIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	pbTopic := testutil.CreateTopic(t, "produce-topic-pb")
+
+	protoPath := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata")
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	value := `{"producedAt":"2021-12-01T14:10:1`
+
+	if _, err := kafkaCtl.Execute("produce", pbTopic,
+		"--value", value, "--value-proto-type", "unknown",
+		"--proto-import-path", protoPath, "--proto-file", "msg.proto"); err != nil {
+		testutil.AssertErrorContains(t, "not found in provided files", err)
+	} else {
+		t.Fatalf("Expected producer to fail")
+	}
+}
+
+func TestProduceLongMessageSucceedsIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topic := testutil.CreateTopic(t, "produce-topic-long")
+
+	file, err := os.CreateTemp(os.TempDir(), "long-message-")
+	if err != nil {
+		t.Fatalf("unable to generate test file: %v", err)
+	}
+	defer os.Remove(file.Name())
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	data := make([]byte, bufio.MaxScanTokenSize)
+
+	for i := range data {
+		data[i] = 'K'
+	}
+
+	if err := os.WriteFile(file.Name(), data, 0644); err != nil {
+		t.Fatalf("unable to write test file: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--file", file.Name()); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "1 messages produced", kafkaCtl.GetStdOut())
+}
+
+func TestProduceLongMessageFailsIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topic := testutil.CreateTopic(t, "produce-topic-long")
+
+	file, err := os.CreateTemp(os.TempDir(), "long-message-")
+	if err != nil {
+		t.Fatalf("unable to generate test file: %v", err)
+	}
+	defer os.Remove(file.Name())
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	data := make([]byte, bufio.MaxScanTokenSize)
+
+	for i := range data {
+		data[i] = 'K'
+	}
+
+	if err := os.WriteFile(file.Name(), data, 0644); err != nil {
+		t.Fatalf("unable to write test file: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--max-message-bytes", strconv.Itoa(bufio.MaxScanTokenSize), "--file", file.Name()); err != nil {
+		testutil.AssertErrorContains(t, "error reading input (try specifying --max-message-bytes when producing long messages)", err)
+	} else {
+		t.Fatalf("Expected producer to fail")
+	}
+}
+
+func TestProduceMessageCountExcludesFailedMessagesIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topic := testutil.CreateTopic(t, "produce-topic-count")
+
+	file, err := os.CreateTemp(os.TempDir(), "too-large-message-")
+	if err != nil {
+		t.Fatalf("unable to generate test file: %v", err)
+	}
+	defer os.Remove(file.Name())
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	// 2 MB message: passes the client-side limit configured below, but exceeds the
+	// broker's default message.max.bytes (1048588), so the broker rejects it.
+	data := bytes.Repeat([]byte("K"), 2*1024*1024)
+
+	if err := os.WriteFile(file.Name(), data, 0644); err != nil {
+		t.Fatalf("unable to write test file: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--max-message-bytes", strconv.Itoa(3*1024*1024), "--file", file.Name()); err != nil {
+		testutil.AssertErrorContains(t, "Failed to produce message", err)
+	} else {
+		t.Fatalf("Expected producer to fail")
+	}
+
+	testutil.AssertEquals(t, "0 messages produced", kafkaCtl.GetStdOut())
+}
+
+func marshalJSON(message *dynamicpb.Message) ([]byte, error) {
+	jsonValue, err := protojson.MarshalOptions{Indent: ""}.Marshal(message)
+	if err != nil {
+		return nil, err
+	}
+
+	// this is needed to eliminate whitespace randomization
+	// https://github.com/golang/protobuf/issues/1082
+	buffer := new(bytes.Buffer)
+	if err := json.Compact(buffer, jsonValue); err != nil {
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}

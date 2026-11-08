@@ -1,0 +1,27 @@
+name: Publish github pages
+on:
+  push:
+    tags:
+      - v*
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      -
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      -
+        name: Build and generate docs
+        run: make docs DOCS_TARGET=pages
+      -
+        name: Deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: pages
